@@ -1,15 +1,13 @@
-import json
-import socket
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
 from AppKit import NSBitmapImageRep, NSControlStateValueOn, NSDeviceRGBColorSpace, NSGraphicsContext, NSMenu
 
 import menubar
-from menubar import POLL_SECONDS, clock, fetch, fill, icon_share, pie, watch
+from accounts import Account
+from menubar import POLL_SECONDS, clock, fill, icon_share, pie, watch
+from usage import Usage
 
 HOUR = 60 * 60
 SIZE = 18
@@ -28,7 +26,7 @@ def usage(*windows: tuple, ok: bool = True, error: str | None = None, checked_at
 
 
 def answer(engine: str | None = "claude2") -> dict:
-    """What /api/usage answers while passes open on the claude2 alias, Claude,
+    """A usage report while passes open on the claude2 alias, Claude,
     Codex and Gemini having all run out: Claude's weekly window spent and its
     reading gone stale, Codex with only a weekly window, and Gemini's reading
     failed."""
@@ -66,26 +64,22 @@ def filled(bitmap: NSBitmapImageRep, *pixels: tuple[int, int]) -> list[bool]:
     return [bitmap.colorAtX_y_(x, y).alphaComponent() > 0.5 for x, y in pixels]
 
 
-class FakeServer(BaseHTTPRequestHandler):
-    body = b""
-
-    def log_message(self, format, *args):
-        pass
-
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(FakeServer.body)
+class Enough(Exception):
+    pass
 
 
 @pytest.fixture
-def server():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{server.server_address[1]}/api/usage"
-    server.shutdown()
-    server.server_close()
+def waits(monkeypatch) -> list[float]:
+    """Every wait watch() makes between readings, the second ending it."""
+    waited = []
+
+    def sleep(seconds):
+        waited.append(seconds)
+        if len(waited) == 2:
+            raise Enough
+
+    monkeypatch.setattr(menubar, "time", SimpleNamespace(sleep=sleep))
+    return waited
 
 
 def test_the_pie_is_the_session_window_of_the_cli_the_next_pass_opens_on():
@@ -100,7 +94,7 @@ def test_the_pie_is_full_while_every_cli_is_spent_since_the_next_pass_waits():
     assert icon_share(answer(engine=None)) == 1
 
 
-def test_there_is_nothing_to_fill_the_pie_with_while_clear_backlog_isnt_answering_or_a_reading_failed():
+def test_there_is_nothing_to_fill_the_pie_with_while_usage_cant_be_read_or_a_reading_failed():
     assert icon_share(None) is None
     assert icon_share(answer(engine="gemini")) is None
 
@@ -146,7 +140,7 @@ def test_the_menu_says_the_next_pass_waits_and_ticks_nothing_while_every_cli_is_
 def test_each_answer_replaces_the_menu_and_one_that_never_came_says_why():
     menu = fill(NSMenu.alloc().init(), answer())
 
-    assert rows(fill(menu, None)) == [("Couldn't read the usage windows: clear_backlog.py isn't answering", False, True)]
+    assert rows(fill(menu, None)) == [("Couldn't read the usage windows: menubar.log says why", False, True)]
 
 
 def test_the_pie_fills_clockwise_from_twelve_oclock():
@@ -170,37 +164,51 @@ def test_the_pie_with_nothing_to_show_is_a_faint_ring_and_every_pie_takes_the_me
     assert pie(None, SIZE).isTemplate() and pie(0.5, SIZE).isTemplate()
 
 
-def test_fetch_reads_what_api_usage_answers(server):
-    FakeServer.body = json.dumps({"engine": "claude", "claude": {"windows": []}}).encode()
+def test_the_menu_shows_what_it_reads_itself_with_nothing_else_running():
+    usage = Usage(read=lambda: {"five_hour": {"utilization": 12.0, "resets_at": None},
+                                "seven_day": {"utilization": 30.0, "resets_at": None}},
+                  read_codex=list, read_gemini=list,
+                  accounts=lambda: [Account("claude2", ("claude",), {"CLAUDE_CONFIG_DIR": "/tmp/claude-2"})],
+                  read_account=lambda account: {"five_hour": {"utilization": 50.0, "resets_at": None}})
+    report = usage.report()
 
-    assert fetch(server) == {"engine": "claude", "claude": {"windows": []}}
+    assert icon_share(report) == pytest.approx(0.12)
+    assert rows(fill(NSMenu.alloc().init(), report)) == [
+        ("Claude", True, False),
+        ("  Session 12% used", False, False),
+        ("  Weekly 30% used", False, False),
+        ("", False, True),
+        ("Claude 2", False, False),
+        ("  Session 50% used", False, False),
+        ("", False, True),
+        ("Codex", False, False),
+        ("", False, True),
+        ("Gemini", False, False),
+    ]
 
 
-def test_fetch_is_none_for_an_answer_that_isnt_json_or_while_nothing_answers(server):
-    FakeServer.body = b"<!doctype html>"
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        closed = f"http://127.0.0.1:{probe.getsockname()[1]}/api/usage"
+def test_watch_hands_each_reading_to_the_menu_bar_and_waits_between_readings(waits):
+    shown = []
 
-    assert fetch(server) is None
-    assert fetch(closed) is None
-
-
-def test_watch_hands_each_answer_to_the_menu_bar_and_waits_between_questions(server, monkeypatch):
-    FakeServer.body = json.dumps({"engine": "claude"}).encode()
-    shown, waits = [], []
-
-    class Enough(Exception):
-        pass
-
-    def sleep(seconds):
-        waits.append(seconds)
-        if len(waits) == 2:
-            raise Enough
-
-    monkeypatch.setattr(menubar, "time", SimpleNamespace(sleep=sleep))
     with pytest.raises(Enough):
-        watch(server, shown.append)
+        watch(lambda: {"engine": "claude"}, shown.append)
 
     assert shown == [{"engine": "claude"}] * 2
     assert waits == [POLL_SECONDS] * 2
+
+
+def test_a_reading_that_blows_up_shows_as_nothing_read_and_the_watching_carries_on(waits, capsys):
+    readings = iter([RuntimeError("the Keychain fell over"), {"engine": "claude"}])
+    shown = []
+
+    def read():
+        found = next(readings)
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+    with pytest.raises(Enough):
+        watch(read, shown.append)
+
+    assert shown == [None, {"engine": "claude"}]
+    assert "the Keychain fell over" in capsys.readouterr().err

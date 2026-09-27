@@ -3,29 +3,38 @@
 LLM usage in the macOS menu bar. The icon is a pie of the session window of the CLI the next pass opens on,
 filled clockwise from twelve with the share used. Clicking it lists every CLI — Claude, each alias account,
 Codex, then Gemini — the one passes open on ticked, each with a pie of its own and its session and weekly
-windows as the share used and when they reset. With every CLI spent the pie is full. A faint ring means
-nothing is answering, or that CLI's reading failed.
+windows as the share used and when they reset. With every CLI spent the pie is full. A faint ring means that
+CLI's reading failed.
 
 ## Where the numbers come from
 
-It reads no usage of its own. Every 30 seconds it asks `http://127.0.0.1:5078/api/usage`, the endpoint
-clear_backlog.py's page reads, so the two always match. The answer names the CLI the next pass opens on
-(`null` while every CLI is spent) and each CLI's windows, `used` being the percent of the window used:
+It reads them itself, each CLI at most once a minute:
 
-```json
-{
-  "engine": "claude2",
-  "claude": {"ok": true, "error": null, "checked_at": 1790000000,
-             "windows": [{"key": "five_hour", "label": "Session", "used": 8.4, "resets_at": 1790007200},
-                         {"key": "seven_day", "label": "Weekly", "used": 34.0, "resets_at": 1790180000}]},
-  "accounts": [{"name": "claude2", "ok": true, "error": null, "checked_at": 1790000000, "windows": []}],
-  "codex": {"ok": true, "error": null, "checked_at": 1790000000, "windows": []},
-  "gemini": {"ok": false, "error": "agy isn't signed in", "checked_at": null, "windows": []}
-}
-```
+- **Claude** (`usage.py`): the numbers `/usage` shows, asked of the endpoint the `/usage` dialog calls with
+  the OAuth token Claude Code keeps in the macOS Keychain. The token is read for the request and never kept,
+  printed or logged.
+- **Each alias account** (`accounts.py`): every `claude<N>` alias in `~/.zshrc` that signs in with a config
+  dir of its own, read the same way off its own Keychain login.
 
-A CLI whose reading failed says why in `error`. One with `ok` still true and an `error` is showing the
-last good windows, read at `checked_at`.
+  ```
+  alias claude2='CLAUDE_CONFIG_DIR=~/.claude-2 claude'
+  ```
+
+- **Codex** (`codex_usage.py`): off the rollout files Codex writes its turns to under `~/.codex-5/sessions/`.
+  Only an interactive `codex` records its limits there; `codex exec` leaves them blank.
+- **Gemini** (`gemini_usage.py`): `agy -p /usage`, which answers without running a model turn.
+
+"The CLI the next pass opens on" is the first in that order not spent past 95% of its session or weekly
+window. A login whose weekly window is spent rotates on to the next login before Codex and Gemini.
+
+The usage endpoint rate limits. A reading that fails is not asked for again for five minutes, or for as long
+as the refusal's `Retry-After` says, and the last good windows keep standing in the meantime, with the reason
+they aren't refreshing under them. A login's Keychain token also expires while no Claude Code runs on it; the
+next Claude Code session on that login renews it.
+
+Everything read is kept in `~/Library/Caches/llm-usage-tracker/usage.json`. Any other process that reads
+usage through these modules with the same file (clear-backlog's loop does) shares the readings, so between them each CLI is still read once a minute at most, and the last
+good windows outlive a restart.
 
 ## Run it
 
@@ -37,11 +46,11 @@ python3 menubar.py
 ```
 
 It runs as the launch agent `com.john.llm-usage-tracker`
-(`~/Library/LaunchAgents/com.john.llm-usage-tracker.plist`), apart from clear_backlog.py, so restarting
-either leaves the other alone. It logs to `menubar.log`.
+(`~/Library/LaunchAgents/com.john.llm-usage-tracker.plist`), through a login zsh so it has the terminal's
+`PATH` for `agy`. It starts at login, launchd starts it again if it ever exits, and it logs to `menubar.log`.
 
 ```
-launchctl kickstart -k gui/$(id -u)/com.john.llm-usage-tracker                              # restart after changing menubar.py
+launchctl kickstart -k gui/$(id -u)/com.john.llm-usage-tracker                              # restart after changing it
 launchctl bootout gui/$(id -u)/com.john.llm-usage-tracker                                   # take it out of the menu bar until next login
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.john.llm-usage-tracker.plist    # put it back
 ```

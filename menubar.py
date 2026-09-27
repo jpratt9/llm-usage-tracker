@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Clear Backlog's usage in the menu bar.
+"""LLM usage in the menu bar.
 
 The icon is a pie of the session window of the CLI the next pass opens on: the
 share of it used, filled clockwise from twelve o'clock. Clicking it opens a menu
 of every CLI, in the order passes fall back through them, the one passes open on
 ticked, each with a pie of its own and its session and weekly windows as the
 share used and when they reset. With every CLI spent the pie is full, since the
-next pass waits. With nothing to show, clear_backlog.py not answering or a
-reading that failed, it is a faint ring.
+next pass waits. With nothing to show, a reading that failed, it is a faint ring.
 
-The numbers are clear_backlog.py's, asked of the same /api/usage the page's
-usage strip reads, so they match it and cost no reading of their own.
+The numbers are read here, by usage.py: Claude's login and each alias account's
+off the Keychain and the endpoint /usage asks, Codex's off the rollout files it
+writes and Gemini's off agy's /usage. They are kept in usage.SHARED, which
+clear_backlog.py reads usage through too, so the menu and its page match and
+cost one reading between them. Nothing here needs clear_backlog.py running.
 
     python3 menubar.py
 
@@ -18,12 +20,10 @@ It runs as the launch agent com.john.llm-usage-tracker, apart from
 clear_backlog.py, so either restarts without the other.
 """
 
-import json
-import re
 import sys
 import threading
 import time
-import urllib.request
+import traceback
 from functools import partial
 from typing import Callable
 
@@ -32,19 +32,11 @@ from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory, NSBez
                     NSMidY, NSStatusBar, NSVariableStatusItemLength, NSWidth)
 from PyObjCTools import AppHelper
 
-# The CLIs by the names /api/usage gives them. An alias account is named for its
-# zsh alias, claude2 for `alias claude2=...`.
-CLAUDE = "claude"
-CODEX = "codex"
-GEMINI = "gemini"
-ALIAS_NAME = re.compile(r"claude(\d+)")
+from accounts import account_label, claude_aliases
+from usage import CLAUDE, CODEX, GEMINI, SHARED, Usage
 
-USAGE_URL = "http://127.0.0.1:5078/api/usage"
-# As often as the page's usage strip asks: usage moves slowly, and the server
-# caches it for a minute anyway.
+# Usage moves slowly, and usage.py reads each CLI once a minute at most anyway.
 POLL_SECONDS = 30
-# The first question after that cache runs out waits on every CLI being read.
-TIMEOUT_SECONDS = 60
 # Points. The menu bar's own icons are about this big, and a menu row's a little smaller.
 ICON_SIZE = 18
 ROW_ICON_SIZE = 14
@@ -59,17 +51,7 @@ def clock(at: float) -> str:
 
 def engine_name(engine: str) -> str:
     """How a CLI is named in the menu, an alias account such as claude2 as "Claude 2"."""
-    alias = ALIAS_NAME.fullmatch(engine)
-    return {CLAUDE: "Claude", CODEX: "Codex", GEMINI: "Gemini"}.get(engine) or (f"Claude {alias[1]}" if alias else engine)
-
-
-def fetch(url: str) -> dict | None:
-    """What /api/usage answers, or None while clear_backlog.py isn't answering."""
-    try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT_SECONDS) as response:
-            return json.load(response)
-    except (OSError, ValueError):
-        return None
+    return {CLAUDE: "Claude", CODEX: "Codex", GEMINI: "Gemini"}.get(engine) or account_label(engine)
 
 
 def engines(report: dict) -> list[tuple[str, dict]]:
@@ -98,7 +80,7 @@ def share(usage: dict | None) -> float | None:
 def icon_share(report: dict | None) -> float | None:
     """How much of the menu bar's pie is filled: the session window of the CLI
     the next pass opens on. Full while every CLI is spent, since the next pass
-    waits, and None while clear_backlog.py isn't answering."""
+    waits, and None while usage can't be read."""
     if report is None:
         return None
     if report["engine"] is None:
@@ -166,7 +148,7 @@ def fill(menu: NSMenu, report: dict | None) -> NSMenu:
     then why, where its reading failed or has stopped refreshing."""
     menu.removeAllItems()
     if report is None:
-        menu.addItem_(row("Couldn't read the usage windows: clear_backlog.py isn't answering", enabled=False))
+        menu.addItem_(row("Couldn't read the usage windows: menubar.log says why", enabled=False))
         return menu
     if report["engine"] is None:
         menu.addItem_(row("Every CLI's usage is spent: the next pass waits", enabled=False))
@@ -203,11 +185,18 @@ class UsageBar:
         fill(self.menu, report)
 
 
-def watch(url: str, show: Callable[[dict | None], None]) -> None:
-    """Asks for usage every POLL_SECONDS for as long as the app runs and hands
-    each answer to `show`, one question at a time so slow answers never pile up."""
+def watch(read: Callable[[], dict], show: Callable[[dict | None], None]) -> None:
+    """Reads usage every POLL_SECONDS for as long as the app runs and hands each
+    report to `show`, one reading at a time so slow ones never pile up. A
+    reading that blows up is shown as None, its traceback left in the log,
+    rather than ending the watching."""
     while True:
-        show(fetch(url))
+        try:
+            report = read()
+        except Exception:
+            traceback.print_exc()
+            report = None
+        show(report)
         time.sleep(POLL_SECONDS)
 
 
@@ -215,9 +204,10 @@ def main() -> int:
     # No Dock icon and no app menu: only the status item.
     NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     bar = UsageBar()
-    # The asking happens off the main thread, so a slow answer never holds the
-    # menu bar up, and each answer is drawn back on it.
-    threading.Thread(target=watch, args=(USAGE_URL, partial(AppHelper.callAfter, bar.show)), daemon=True).start()
+    usage = Usage(accounts=claude_aliases, shared=SHARED)
+    # The reading happens off the main thread, so a slow one never holds the
+    # menu bar up, and each report is drawn back on it.
+    threading.Thread(target=watch, args=(usage.report, partial(AppHelper.callAfter, bar.show)), daemon=True).start()
     # Ctrl+C quits one started by hand. A crash ends the process for launchd to
     # start again, rather than asking in a panel whether to carry on.
     AppHelper.runEventLoop(installInterrupt=True, unexpectedErrorAlert=lambda: False)
