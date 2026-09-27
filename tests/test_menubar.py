@@ -6,7 +6,7 @@ from AppKit import NSBitmapImageRep, NSControlStateValueOn, NSDeviceRGBColorSpac
 
 import menubar
 from accounts import Account
-from menubar import POLL_SECONDS, clock, fill, icon_share, pie, watch
+from menubar import POLL_SECONDS, clock, fill, icon_share, pause, pie, watch
 from usage import Usage
 
 HOUR = 60 * 60
@@ -78,7 +78,7 @@ def waits(monkeypatch) -> list[float]:
         if len(waited) == 2:
             raise Enough
 
-    monkeypatch.setattr(menubar, "time", SimpleNamespace(sleep=sleep))
+    monkeypatch.setattr(menubar, "time", SimpleNamespace(sleep=sleep, time=time.time))
     return waited
 
 
@@ -212,3 +212,19 @@ def test_a_reading_that_blows_up_shows_as_nothing_read_and_the_watching_carries_
 
     assert shown == [None, {"engine": "claude"}]
     assert "the Keychain fell over" in capsys.readouterr().err
+
+
+def test_the_next_reading_waits_only_until_a_refusal_said_to_come_back_where_that_is_sooner():
+    now = time.time()
+
+    assert pause(None) == POLL_SECONDS
+    assert pause(now + 10 * POLL_SECONDS) == POLL_SECONDS
+    assert pause(now + 5) == pytest.approx(5, abs=1)
+    assert pause(now - 5) == 0
+
+
+def test_watch_follows_a_refusal_up_the_moment_it_said_to(waits):
+    with pytest.raises(Enough):
+        watch(lambda: {"engine": "claude"}, lambda report: None, follow_up=lambda: time.time() + 5)
+
+    assert waits == [pytest.approx(5, abs=1)] * 2

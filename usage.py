@@ -7,8 +7,9 @@ the request and never kept, printed or logged.
 
 The page polls, so the answer is cached: one Keychain read and one request a
 minute at most, however many runs are open. That endpoint rate limits, so a
-reading that fails is not asked for again for RETRY_AFTER_SECONDS, or for as
-long as the refusal's Retry-After says, and the windows the last good reading
+reading that fails is not asked for again for RETRY_AFTER_SECONDS or, where the
+refusal's Retry-After says when to come back, until right then and no later
+(Usage.follow_up_at says when that is), and the windows the last good reading
 found keep standing in the meantime — numbers a few minutes old say far more
 than an error does. The login it rate limits is the one runs are busy on, and
 there the CLI is what keeps the numbers current: every step reports the windows
@@ -80,8 +81,9 @@ WINDOWS = (("five_hour", "Session", "5h"), ("seven_day", "Weekly", "7d"))
 # Percent of a session or weekly window that moves the next pass off that CLI.
 FALLBACK_AT = 95.0
 CACHE_SECONDS = 60
-# A reading that failed isn't asked for again this soon. The usage endpoint
-# rate limits, and asking straight back is what gets it there.
+# A reading that failed isn't asked for again this soon, unless its refusal said
+# when to come back. The usage endpoint rate limits, and asking straight back is
+# what gets it there.
 RETRY_AFTER_SECONDS = 300
 TIMEOUT_SECONDS = 15
 # The file every process reading usage through here keeps its readings in (see
@@ -385,12 +387,29 @@ class Usage:
         or while the endpoint has asked not to be asked."""
         with self.lock:
             found = self.cached.get(engine)
-            now = time.time()
-            if found and (now - found["tried_at"] < self.hold(found) or now < self.quiet_until.get(engine, 0)):
+            if found and time.time() < self.asks_again_at(engine, found):
                 return found
             fresh = self.keep(found, self.read_windows(engine))
             self.cached[engine] = fresh
             return fresh
+
+    def asks_again_at(self, engine: str, found: dict) -> float:
+        """When an engine is next asked for its windows: once its last reading
+        is `hold` old, never while a refusal's Retry-After holds it off, and,
+        where the reading failed with one, the moment it said to come back
+        rather than whenever `retry_after` would have."""
+        quiet = self.quiet_until.get(engine, 0)
+        if found["error"] is not None and quiet >= found["tried_at"]:
+            return quiet
+        return max(found["tried_at"] + self.hold(found), quiet)
+
+    def follow_up_at(self) -> float | None:
+        """The soonest hour a refusal still holding an engine off said to come
+        back, so whatever polls can read again right then instead of at its
+        next poll. None while no refusal is holding one off."""
+        now = time.time()
+        engines = [CLAUDE, *(account.name for account in self.accounts()), CODEX, GEMINI]
+        return min((at for engine in engines if (at := self.quiet_until.get(engine, 0)) > now), default=None)
 
     def heard(self, engine: str, found: dict) -> None:
         """A step's CLI reported the windows of the login it runs as (see

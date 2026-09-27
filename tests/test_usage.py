@@ -674,3 +674,39 @@ def test_a_garbled_shared_file_reads_as_nothing_kept_and_is_written_whole_again(
 
     assert Usage(read=lambda: STEADY, shared=shared).claude()["windows"][0]["used"] == 23.0
     assert json.loads(shared.read_text())["cached"]["claude"]["windows"][0]["used"] == 23.0
+
+
+def test_a_refusal_that_says_when_to_come_back_is_asked_again_right_then_not_after_the_usual_wait(monkeypatch):
+    now = [READ_AT]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    asked = []
+
+    def rate_limited():
+        asked.append(now[0])
+        raise UsageError("usage endpoint said 429", retry_after=90)
+
+    usage = Usage(retry_after=300, read=rate_limited)
+    for later in (0, 89, 90):
+        now[0] = READ_AT + later
+        usage.claude()
+
+    assert asked == [READ_AT, READ_AT + 90]
+
+
+def test_the_follow_up_is_the_soonest_hour_a_refusal_named_that_is_still_to_come(monkeypatch):
+    now = [READ_AT]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    waits = {CLAUDE: 600, "claude2": 90}
+
+    def refuse(engine):
+        raise UsageError("usage endpoint said 429", retry_after=waits[engine])
+
+    accounts = [Account("claude2", ("claude",), {"CLAUDE_CONFIG_DIR": "/opt/claude-2"})]
+    usage = Usage(read=lambda: refuse(CLAUDE), read_codex=list, read_gemini=list, accounts=lambda: accounts,
+                  read_account=lambda account: refuse(account.name))
+    assert usage.follow_up_at() is None
+
+    usage.report()
+    assert usage.follow_up_at() == READ_AT + 90
+    now[0] = READ_AT + 90
+    assert usage.follow_up_at() == READ_AT + 600

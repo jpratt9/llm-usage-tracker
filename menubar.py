@@ -36,6 +36,7 @@ from accounts import account_label, claude_aliases
 from usage import CLAUDE, CODEX, GEMINI, SHARED, Usage
 
 # Usage moves slowly, and usage.py reads each CLI once a minute at most anyway.
+# A refusal that said when to come back is followed up right then instead.
 POLL_SECONDS = 30
 # Points. The menu bar's own icons are about this big, and a menu row's a little smaller.
 ICON_SIZE = 18
@@ -185,9 +186,19 @@ class UsageBar:
         fill(self.menu, report)
 
 
-def watch(read: Callable[[], dict], show: Callable[[dict | None], None]) -> None:
-    """Reads usage every POLL_SECONDS for as long as the app runs and hands each
-    report to `show`, one reading at a time so slow ones never pile up. A
+def pause(follow_up_at: float | None) -> float:
+    """How long to wait for the next reading: POLL_SECONDS, or only until the
+    hour a refusal said to come back where that is sooner."""
+    if follow_up_at is None:
+        return POLL_SECONDS
+    return min(POLL_SECONDS, max(follow_up_at - time.time(), 0))
+
+
+def watch(read: Callable[[], dict], show: Callable[[dict | None], None],
+          follow_up: Callable[[], float | None] = lambda: None) -> None:
+    """Reads usage every POLL_SECONDS for as long as the app runs, or sooner
+    where `follow_up` names the hour a refusal said to come back, and hands
+    each report to `show`, one reading at a time so slow ones never pile up. A
     reading that blows up is shown as None, its traceback left in the log,
     rather than ending the watching."""
     while True:
@@ -197,7 +208,7 @@ def watch(read: Callable[[], dict], show: Callable[[dict | None], None]) -> None
             traceback.print_exc()
             report = None
         show(report)
-        time.sleep(POLL_SECONDS)
+        time.sleep(pause(follow_up()))
 
 
 def main() -> int:
@@ -207,7 +218,8 @@ def main() -> int:
     usage = Usage(accounts=claude_aliases, shared=SHARED)
     # The reading happens off the main thread, so a slow one never holds the
     # menu bar up, and each report is drawn back on it.
-    threading.Thread(target=watch, args=(usage.report, partial(AppHelper.callAfter, bar.show)), daemon=True).start()
+    threading.Thread(target=watch, args=(usage.report, partial(AppHelper.callAfter, bar.show), usage.follow_up_at),
+                     daemon=True).start()
     # Ctrl+C quits one started by hand. A crash ends the process for launchd to
     # start again, rather than asking in a panel whether to carry on.
     AppHelper.runEventLoop(installInterrupt=True, unexpectedErrorAlert=lambda: False)
