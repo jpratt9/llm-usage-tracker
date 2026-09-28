@@ -6,6 +6,9 @@ Codex, then Gemini — the one passes open on ticked, each with a pie of its own
 windows as the share used and when they reset. With every CLI spent the pie is full. A faint ring means that
 CLI's reading failed.
 
+**Show in the menu bar**, at the foot of the menu, changes which CLI the icon is the pie of: the one the next
+pass opens on, as it is by default, or any one CLI. The choice is kept in `settings.json` beside `menubar.py`.
+
 ## Where the numbers come from
 
 It reads them itself, each CLI at most once a minute:

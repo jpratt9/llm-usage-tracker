@@ -8,6 +8,10 @@ ticked, each with a pie of its own and its session and weekly windows as the
 share used and when they reset. With every CLI spent the pie is full, since the
 next pass waits. With nothing to show, a reading that failed, it is a faint ring.
 
+"Show in the menu bar", at the foot of the menu, changes which CLI the icon is
+the pie of: the one the next pass opens on, as it is by default, or any one CLI
+whatever passes do. The choice is kept in settings.json beside this file.
+
 The numbers are read here, by usage.py: Claude's login and each alias account's
 off the Keychain and the endpoint /usage asks, Codex's off the rollout files it
 writes and Gemini's off agy's /usage. They are kept in usage.SHARED, which
@@ -20,21 +24,29 @@ It runs as the launch agent com.john.llm-usage-tracker, apart from
 clear_backlog.py, so either restarts without the other.
 """
 
+import json
 import sys
 import threading
 import time
 import traceback
 from functools import partial
+from pathlib import Path
 from typing import Callable
 
 from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory, NSBezierPath, NSColor,
                     NSControlStateValueOn, NSImage, NSInsetRect, NSMakePoint, NSMenu, NSMenuItem, NSMidX,
                     NSMidY, NSStatusBar, NSVariableStatusItemLength, NSWidth)
+from Foundation import NSObject
 from PyObjCTools import AppHelper
 
 from accounts import account_label, claude_aliases
 from usage import CLAUDE, CODEX, GEMINI, SHARED, Usage
 
+HERE = Path(__file__).resolve().parent
+# Which CLI the icon is the pie of, as "Show in the menu bar" last set it.
+SETTINGS = HERE / "settings.json"
+# The icon's default: whichever CLI the next pass opens on.
+AUTO = "auto"
 # Usage moves slowly, and usage.py reads each CLI once a minute at most anyway.
 # A refusal that said when to come back is followed up right then instead.
 POLL_SECONDS = 30
@@ -78,15 +90,38 @@ def share(usage: dict | None) -> float | None:
     return None if window is None else min(max(window["used"], 0), 100) / 100
 
 
-def icon_share(report: dict | None) -> float | None:
+def shown_in(report: dict, shown: str) -> str:
+    """Which the icon is the pie of: `shown`, or AUTO where that CLI isn't in
+    the answer any more (an alias taken out of ~/.zshrc)."""
+    return shown if shown in dict(engines(report)) else AUTO
+
+
+def icon_share(report: dict | None, shown: str = AUTO) -> float | None:
     """How much of the menu bar's pie is filled: the session window of the CLI
-    the next pass opens on. Full while every CLI is spent, since the next pass
-    waits, and None while usage can't be read."""
+    `shown`, or by default of the CLI the next pass opens on, which is full
+    while every CLI is spent, since the next pass waits. None while usage
+    can't be read or that CLI's reading failed."""
     if report is None:
         return None
+    usages = dict(engines(report))
+    if shown_in(report, shown) != AUTO:
+        return share(usages[shown])
     if report["engine"] is None:
         return 1.0
-    return share(dict(engines(report)).get(report["engine"]))
+    return share(usages.get(report["engine"]))
+
+
+def load_shown(path: Path = SETTINGS) -> str:
+    """The CLI the icon was last set to show, or AUTO where it never was."""
+    try:
+        shown = json.loads(path.read_text(encoding="utf-8")).get("shown")
+    except (OSError, ValueError, AttributeError):
+        return AUTO
+    return shown if isinstance(shown, str) else AUTO
+
+
+def save_shown(shown: str, path: Path = SETTINGS) -> None:
+    path.write_text(json.dumps({"shown": shown}), encoding="utf-8")
 
 
 def window_line(window: dict) -> str:
@@ -143,10 +178,31 @@ def row(title: str, level: int = 0, enabled: bool = True) -> NSMenuItem:
     return item
 
 
-def fill(menu: NSMenu, report: dict | None) -> NSMenu:
+def choices(report: dict, shown: str, target) -> NSMenuItem:
+    """The "Show in the menu bar" row: a submenu of what the icon can be the
+    pie of, the CLI the next pass opens on and then each CLI, ticked on the
+    one it is. Choosing one sends it to `target`'s choose:."""
+    submenu = NSMenu.alloc().init()
+    submenu.setAutoenablesItems_(False)
+    shown = shown_in(report, shown)
+    for key, title in [(AUTO, "The CLI the next pass opens on"),
+                       *((engine, engine_name(engine)) for engine, _ in engines(report))]:
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "choose:", "")
+        item.setTarget_(target)
+        item.setRepresentedObject_(key)
+        if key == shown:
+            item.setState_(NSControlStateValueOn)
+        submenu.addItem_(item)
+    item = row("Show in the menu bar")
+    item.setSubmenu_(submenu)
+    return item
+
+
+def fill(menu: NSMenu, report: dict | None, shown: str = AUTO, target=None) -> NSMenu:
     """Makes the menu say what `report` does: a row per CLI with its pie,
     ticked for the one the next pass opens on, and under it a row per window,
-    then why, where its reading failed or has stopped refreshing."""
+    then why, where its reading failed or has stopped refreshing. Last comes
+    the choice of what the icon shows, `shown` ticked."""
     menu.removeAllItems()
     if report is None:
         menu.addItem_(row("Couldn't read the usage windows: menubar.log says why", enabled=False))
@@ -166,24 +222,48 @@ def fill(menu: NSMenu, report: dict | None) -> NSMenu:
             menu.addItem_(row(window_line(window), level=1))
         if usage["error"]:
             menu.addItem_(row(why(usage), level=1, enabled=False))
+    menu.addItem_(NSMenuItem.separatorItem())
+    menu.addItem_(choices(report, shown, target))
     return menu
+
+
+class Picker(NSObject):
+    """What the "Show in the menu bar" items call when one is chosen. AppKit
+    sends a selector to an Objective-C object rather than calling a Python
+    function, so this hands the choice on to `chosen`."""
+
+    def choose_(self, item):
+        self.chosen(str(item.representedObject()))
 
 
 class UsageBar:
     """The pie in the menu bar and the menu it opens. AppKit's, so only ever
     touched on the main thread."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Path = SETTINGS) -> None:
         self.item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
         self.menu = NSMenu.alloc().init()
         # Every row is there to be read, so none is greyed for having no action.
         self.menu.setAutoenablesItems_(False)
         self.item.setMenu_(self.menu)
         self.item.button().setImage_(pie(None, ICON_SIZE))
+        self.settings = settings
+        self.shown = load_shown(settings)
+        self.report: dict | None = None
+        self.picker = Picker.alloc().init()
+        self.picker.chosen = self.choose
 
     def show(self, report: dict | None) -> None:
-        self.item.button().setImage_(pie(icon_share(report), ICON_SIZE))
-        fill(self.menu, report)
+        self.report = report
+        self.item.button().setImage_(pie(icon_share(report, self.shown), ICON_SIZE))
+        fill(self.menu, report, self.shown, self.picker)
+
+    def choose(self, shown: str) -> None:
+        """"Show in the menu bar" was set to `shown`: kept for the next start
+        and drawn now, not at the next reading."""
+        self.shown = shown
+        save_shown(shown, self.settings)
+        self.show(self.report)
 
 
 def pause(follow_up_at: float | None) -> float:

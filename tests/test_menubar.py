@@ -2,11 +2,13 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from AppKit import NSBitmapImageRep, NSControlStateValueOn, NSDeviceRGBColorSpace, NSGraphicsContext, NSMenu
+from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory, NSBitmapImageRep, NSControlStateValueOn,
+                    NSDeviceRGBColorSpace, NSGraphicsContext, NSMenu)
 
 import menubar
 from accounts import Account
-from menubar import POLL_SECONDS, clock, fill, icon_share, pause, pie, watch
+from menubar import (AUTO, POLL_SECONDS, Picker, clock, fill, icon_share, load_shown, pause, pie, save_shown,
+                     watch)
 from usage import Usage
 
 HOUR = 60 * 60
@@ -118,12 +120,15 @@ def test_the_menu_lists_every_cli_with_its_windows_as_the_share_used_ticking_the
         ("", False, True),
         ("Gemini", False, False),
         ("  agy isn't signed in", False, True),
+        ("", False, True),
+        ("Show in the menu bar", False, False),
     ]
 
 
 def test_every_cli_in_the_menu_has_a_pie_of_its_own():
     menu = fill(NSMenu.alloc().init(), answer())
-    names = [item for item in menu.itemArray() if item.indentationLevel() == 0 and not item.isSeparatorItem()]
+    names = [item for item in menu.itemArray()
+             if item.indentationLevel() == 0 and not item.isSeparatorItem() and not item.hasSubmenu()]
 
     assert [item.title() for item in names] == ["Claude", "Claude 2", "Codex", "Gemini"]
     assert all(item.image() is not None and item.image().isTemplate() for item in names)
@@ -184,6 +189,8 @@ def test_the_menu_shows_what_it_reads_itself_with_nothing_else_running():
         ("Codex", False, False),
         ("", False, True),
         ("Gemini", False, False),
+        ("", False, True),
+        ("Show in the menu bar", False, False),
     ]
 
 
@@ -228,3 +235,53 @@ def test_watch_follows_a_refusal_up_the_moment_it_said_to(waits):
         watch(lambda: {"engine": "claude"}, lambda report: None, follow_up=lambda: time.time() + 5)
 
     assert waits == [pytest.approx(5, abs=1)] * 2
+
+
+def test_the_icon_can_show_any_one_cli_instead_of_the_one_the_next_pass_opens_on():
+    assert icon_share(answer(), "codex") == pytest.approx(0.6)
+    assert icon_share(answer(), "claude") == 0
+    # Its own session window, not a full pie, while every CLI is spent.
+    assert icon_share(answer(engine=None), "codex") == pytest.approx(0.6)
+    # A faint ring for one whose reading failed.
+    assert icon_share(answer(), "gemini") is None
+
+
+def test_a_cli_gone_from_the_answer_shows_as_the_default():
+    assert icon_share(answer(), "claude9") == icon_share(answer(), AUTO) == pytest.approx(0.084)
+
+
+def test_show_in_the_menu_bar_offers_the_default_and_every_cli_ticking_the_one_shown():
+    def offered(shown: str) -> list[tuple[str, bool]]:
+        submenu = fill(NSMenu.alloc().init(), answer(), shown).itemArray()[-1].submenu()
+        return [(item.title(), item.state() == NSControlStateValueOn) for item in submenu.itemArray()]
+
+    assert offered("codex") == [("The CLI the next pass opens on", False), ("Claude", False), ("Claude 2", False),
+                                ("Codex", True), ("Gemini", False)]
+    assert [ticked for _, ticked in offered(AUTO)] == [True, False, False, False, False]
+    assert [ticked for _, ticked in offered("claude9")] == [True, False, False, False, False]
+
+
+def test_choosing_one_hands_it_to_the_menu_bar():
+    # A chosen item's action goes through the app, as it does in the menu bar;
+    # accessory, as main() makes it, so no Dock icon comes up.
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    picker = Picker.alloc().init()
+    chosen = []
+    picker.chosen = chosen.append
+    submenu = fill(NSMenu.alloc().init(), answer(), AUTO, picker).itemArray()[-1].submenu()
+
+    submenu.performActionForItemAtIndex_(3)
+    submenu.performActionForItemAtIndex_(0)
+
+    assert chosen == ["codex", AUTO]
+
+
+def test_the_choice_is_kept_between_starts_and_is_the_default_until_one_is_made(tmp_path):
+    settings = tmp_path / "settings.json"
+    assert load_shown(settings) == AUTO
+
+    save_shown("claude2", settings)
+    assert load_shown(settings) == "claude2"
+
+    settings.write_text("{not json")
+    assert load_shown(settings) == AUTO
